@@ -1,1 +1,132 @@
-abcd
+Yes. Add the mock-data investigation as a separate section in the RCA, preferably after the production-log analysis and before the final conclusion. I would use the following wording almost exactly.
+
+⸻
+
+Mock Data Validation / Reproduction Attempt
+
+Since the original production ZIP/PDF contains sensitive production data and could not be shared for non-production testing, a mock EOSMODEL EPIC ZIP was used to validate the processing flow in the DEV environment.
+
+Test Data
+
+The mock request was submitted for:
+
+Parameter	Value
+Policy Number	76288667
+Requesting System	APP-2361
+Vendor	EPIC
+Vendor Patient ID	50337d74-aec7-4a40-8b80-25604bc8a83
+Processing Environment	DEV
+Input	Mock EOSMODEL EPIC ZIP
+Test Date	September 29, 2026
+
+The mock ZIP contained sample PDF files representing the EOSMODEL document structure. The ZIP was uploaded to the EPIC input bucket to validate whether the application could process the file through the existing EPIC ZIP-to-PDF flow.
+
+⸻
+
+Observed Processing Flow
+
+The application successfully picked up the mock ZIP from the input location and moved it to the in-process location. The EPIC processing flow was then initiated successfully.
+
+The logs show that:
+
+1. The ZIP file was detected and moved from the input location to the in-process location.
+2. GenerateEPICFinalPDFS3 was invoked.
+3. The application identified the requesting system as APP-2361.
+4. A temporary processing directory was successfully created and was confirmed to exist and be writable.
+5. ConvertEPICZipToPDFS3 / convertEPICFilesToPDFS3 processing was initiated.
+6. During ZIP/PDF processing, the application encountered an error related to the ZIP entry compression format. The log indicates that only DEFLATED ZIP entries are supported/processed.
+7. As a result, the expected PDF files were not successfully generated/extracted from the ZIP.
+8. The subsequent processing therefore reported:
+    * PolicyFilePath: null
+    * Found 0 PDF files
+    * Valid PDF File Count: 0
+    * No output PDF generated.
+
+⸻
+
+Result of Mock Test
+
+The mock test did not reproduce the production PDF-specific failure observed in the August production logs.
+
+The reason is that the mock ZIP failed at an earlier stage of processing due to its ZIP-entry compression format. Therefore, the contained PDF files did not reach the same PDF conversion/Aspose processing stage where the production failure was observed.
+
+The observed flow was:
+
+Mock ZIP uploaded
+      ↓
+ZIP picked up successfully
+      ↓
+Moved to in-process
+      ↓
+EPIC ZIP-to-PDF processing started
+      ↓
+ZIP entry processing error
+(only DEFLATED entries supported/processed)
+      ↓
+No PDFs generated/extracted
+      ↓
+PolicyFilePath = null
+      ↓
+Valid PDF Count = 0
+      ↓
+No final PDF generated
+
+⸻
+
+Important Finding
+
+The mock test confirms that the overall EPIC processing pipeline is being triggered correctly, including S3 pickup, file movement, temporary directory creation, and initiation of the EPIC conversion flow.
+
+However, this test cannot be used as evidence that the mock PDF has the same PDF-content issue as the production PDF because the processing stopped before the PDF could reach the relevant conversion/merge stage.
+
+Therefore, the mock test should be considered a partial reproduction/validation of the processing flow, rather than a complete reproduction of the production incident.
+
+⸻
+
+Next Validation
+
+To continue the reproduction using the available mock data, the mock ZIP should be recreated using DEFLATED compression and submitted again through the DEV input bucket.
+
+The objective of the second test is to allow the contained PDFs to reach the actual PDF conversion and merge stages.
+
+The next test should specifically verify whether the application subsequently encounters the same type of PDF/Aspose processing error observed in production.
+
+Expected investigation path
+
+DEFLATED mock ZIP
+      ↓
+ZIP extraction
+      ↓
+PDF conversion
+      ↓
+Aspose PDF processing
+      ↓
+PDF validation
+      ↓
+PDF merge
+      ↓
+Final PDF generation
+      ↓
+Delivery
+
+If the DEFLATED mock ZIP reaches the PDF conversion stage successfully, we can then compare its behavior with the production logs for the affected PDF:
+
+72170-4_1002036770_20250617.pdf
+
+⸻
+
+RCA Status After Mock Test
+
+Production RCA: Still based on the production logs and the behavior of the affected production PDF.
+
+Mock-data finding: The current mock test exposed a separate ZIP-format compatibility issue and did not reproduce the production PDF-content failure.
+
+Conclusion at this stage: Additional testing with a correctly DEFLATED mock ZIP is required before concluding that the mock PDF reproduces the production issue.
+
+⸻
+
+One sentence I strongly recommend adding to the RCA
+
+Due to production-data sensitivity, the original production ZIP/PDF could not be used for reproduction in DEV; therefore, a mock EOSMODEL ZIP was used for validation. The initial mock test did not reach the PDF conversion stage because of a ZIP compression-format issue, so it does not by itself establish the root cause of the production PDF failure.
+
+This wording keeps the RCA technically accurate and prevents anyone reviewing it from asking, “If the mock failed, how do you know it is the same issue as production?”
