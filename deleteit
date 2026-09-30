@@ -1,1 +1,473 @@
-dhdgf
+Yes. With the production logs + the three methods + Ashvi’s discussion, we can now make the RCA much more concrete.
+
+One important point from the production analysis: the problematic production case is EPIC case 76696817, and the PDF identified as causing the issue is 72170-4_1002036770_20250617.pdf. When that PDF is excluded, final PDF generation succeeds.
+
+Below is the final RCA content I would put into the document. I am intentionally not including code yet.
+
+⸻
+
+RCA – EPIC PDF Merge Failure – Invalid Annotation Dictionary
+
+1. Issue Summary
+
+During EPIC document processing, the ZIP file was successfully downloaded and the individual PDF files were generated successfully. However, the process failed during the final PDF merge operation when Aspose PDF attempted to process one of the PDF documents.
+
+The production exception observed was:
+
+“An attempt to create annotation using invalid dictionary”
+
+The failure occurred during the file-based PDF merge / blank-page merge stage, resulting in the complete ZIP processing being treated as failed and the input ZIP being moved to the unprocessed location.
+
+⸻
+
+2. Production Case
+
+EPIC Case: 76696817
+
+Problematic PDF identified:
+
+72170-4_1002036770_20250617.pdf
+
+Production analysis showed that when this PDF was excluded from the final merge, the remaining PDFs could be processed and the final PDF was generated successfully.
+
+⸻
+
+3. Current Processing Flow
+
+The current flow is:
+
+EPIC ZIP received
+      ↓
+ZIP downloaded from S3
+      ↓
+PDF files identified
+      ↓
+Each PDF transformed using Aspose
+      ↓
+Transformed PDFs stored in temporary directory
+      ↓
+Blank page inserted at required position
+      ↓
+pdfMergeToFileWithBlankPage()
+      ↓
+pdfMergeToFile()
+      ↓
+Aspose PDF page merge
+      ↓
+Final merged PDF
+      ↓
+PDF optimization
+      ↓
+Final delivery
+
+The production failure occurs after the individual PDF transformation stage, during the merge processing.
+
+⸻
+
+4. Evidence From Production Logs
+
+The production logs show:
+
+* 5 PDF files were found in the ZIP.
+* No PDFs were skipped during the initial processing.
+* Individual PDF transformations completed.
+* The application then initiated the blank-page merge.
+* The blank page was inserted at position 2.
+* The resulting merge contained 6 files — 5 transformed PDFs + 1 blank-page PDF.
+* The merge subsequently failed with the Aspose exception:
+
+An attempt to create annotation using invalid dictionary
+
+Therefore, the failure is not related to S3 download, ZIP extraction, or initial PDF creation.
+
+⸻
+
+5. Root Cause
+
+Primary Root Cause
+
+One of the source PDFs contains PDF annotation/object metadata that Aspose is unable to process correctly during the page merge operation.
+
+For the investigated production case, the problematic document was:
+
+72170-4_1002036770_20250617.pdf
+
+The document can pass through the individual PDF transformation stage, but Aspose encounters an invalid annotation dictionary when the document is subsequently incorporated into the combined PDF.
+
+This explains why:
+
+PDF transformation = successful
+
+but:
+
+PDF merge = failure
+
+The issue is therefore related to PDF content/annotation compatibility during Aspose merge processing, rather than the ZIP or S3 processing itself.
+
+⸻
+
+6. Why the Current Implementation Causes the Entire ZIP to Fail
+
+The current pdfMergeToFile() processes all PDFs as one merge operation.
+
+Conceptually:
+
+PDF 1
+PDF 2
+PDF 3
+PDF 4  ← problematic PDF
+PDF 5
+   ↓
+ONE merge operation
+   ↓
+Aspose exception
+   ↓
+merge fails
+   ↓
+exception propagates to outer ZIP processing
+   ↓
+entire ZIP processing fails
+
+The outer exception handling currently treats the merge failure as a failure of the entire ZIP.
+
+Therefore, one problematic PDF prevents the remaining valid PDFs from producing the final result.
+
+This is the main handling gap that needs to be addressed.
+
+⸻
+
+7. Blank Page Is Not Identified as the Root Cause
+
+The pdfMergeToFileWithBlankPage() method correctly creates an additional file array and inserts the blank PDF at the requested position.
+
+For the production scenario:
+
+PDF 1
+↓
+Blank Page
+↓
+PDF 2
+↓
+PDF 3
+↓
+PDF 4
+↓
+PDF 5
+
+The method itself does not show an indexing problem.
+
+The blank-page merge is the point where the problematic PDF is ultimately passed into the common merge operation, but the current evidence does not establish that BlankPageMockPDF itself is corrupt.
+
+Therefore the RCA should say:
+
+The failure occurs during the blank-page/final merge flow, but the identified problematic source document is 72170-4_1002036770_20250617.pdf; the blank page is not considered the root cause.
+
+⸻
+
+8. Additional Observation – PDF Resize Warnings
+
+During individual PDF transformation, the logs contain messages similar to:
+
+Skipping resize for page 1 due to Aspose error
+Skipping resize for page 2 due to Aspose error
+Skipping resize for page 3 due to Aspose error
+
+The current implementation catches these exceptions and continues processing.
+
+Therefore, these warnings are non-fatal in the current implementation and the PDF transformation subsequently completes.
+
+However, these messages indicate that the input PDFs contain content that Aspose cannot fully process during certain operations.
+
+This should be considered a contributing compatibility indicator and should be monitored, but it should not be documented as the confirmed root cause of the invalid dictionary exception.
+
+⸻
+
+9. Required Fixes
+
+Fix 1 – Do not allow one bad PDF to fail the entire ZIP
+
+This is the primary functional fix.
+
+The merge process should be changed so that PDFs are handled individually.
+
+Expected behavior:
+
+PDF 1 → valid → include
+PDF 2 → valid → include
+PDF 3 → invalid → skip + log
+PDF 4 → valid → include
+PDF 5 → valid → include
+        ↓
+Merge valid PDFs
+        ↓
+Generate final PDF
+
+For the production case:
+
+72170-4_1002036770_20250617.pdf
+
+would be identified as non-mergeable and excluded from the final PDF, while the remaining valid PDFs continue through processing.
+
+Important
+
+The skipped PDF must be explicitly recorded in the logs so that operations/support can identify exactly what was excluded.
+
+⸻
+
+10. Fix 2 – Add Per-PDF Exception Handling During Merge
+
+Currently the merge operation does not provide sufficient visibility into which source PDF caused the failure.
+
+The implementation should add exception handling around each PDF’s merge operation.
+
+The logging should capture:
+
+* EPIC case/policy number
+* source PDF filename
+* source PDF path
+* PDF index
+* page count
+* merge stage
+* exception type
+* complete exception/stack trace
+
+Example expected logging concept:
+
+PDF Merge - Processing file 4/6
+File: 72170-4_1002036770_20250617.pdf
+Pages: X
+Merge failed
+Exception: Invalid annotation dictionary
+Action: Skipping PDF
+
+This directly addresses Ashvi’s request for more detailed exception-level logging.
+
+⸻
+
+11. Fix 3 – Separate Merge Failure From ZIP Failure
+
+The current outer processing treats an exception from PDF merge as a ZIP-level failure.
+
+This should be changed.
+
+Current behavior
+
+PDF merge failure
+      ↓
+Exception propagated
+      ↓
+ZIP processing fails
+      ↓
+ZIP moved to unprocessed
+
+Required behavior
+
+PDF merge failure for one document
+      ↓
+Log problematic PDF
+      ↓
+Skip problematic PDF
+      ↓
+Continue with remaining PDFs
+      ↓
+Generate final PDF
+      ↓
+Continue normal delivery
+
+The ZIP should only be considered failed if no usable PDFs remain or if a critical processing step itself fails.
+
+⸻
+
+12. Fix 4 – Preserve Information About Skipped PDFs
+
+The existing logging already has:
+
+Valid PDF File Count
+Skipped PDFs During Merge Count
+Skipped PDFs During Merge
+
+This should be extended so that skipped files are explicitly captured with the reason.
+
+For example:
+
+Valid PDFs: 4
+Skipped PDFs: 1
+Skipped:
+72170-4_1002036770_20250617.pdf
+Reason: Invalid annotation dictionary during Aspose merge
+
+This will make production troubleshooting much easier.
+
+⸻
+
+13. Fix 5 – Add Pre-Merge PDF Validation
+
+Before performing the final merge, each transformed PDF should be validated for merge compatibility.
+
+The validation should specifically cover:
+
+* PDF can be opened successfully by the configured Aspose version.
+* PDF pages can be accessed.
+* PDF can be processed without an invalid annotation/object dictionary.
+* PDF can be incorporated into the merge operation.
+
+If validation fails:
+
+PDF marked as non-mergeable
+        ↓
+Logged
+        ↓
+Excluded from final merge
+        ↓
+Remaining PDFs processed
+
+This is preferable to discovering the bad document only after the entire merge operation has already started.
+
+⸻
+
+14. Fix 6 – Review and Upgrade Aspose PDF Version
+
+As specifically requested by Ashvi, the current Aspose PDF library version must be reviewed.
+
+The team should:
+
+1. Identify the exact Aspose PDF version currently used in the application.
+2. Check whether the version is outdated.
+3. Review Aspose release notes/issues related to:
+    * annotation dictionaries
+    * PDF page merging
+    * invalid PDF dictionaries
+    * PDF annotations
+    * PDF save/serialization
+4. Move to the latest approved/compatible Aspose version if applicable.
+5. Regression-test the EPIC PDF workflow after the upgrade.
+
+Important RCA wording
+
+Do not state:
+
+“Upgrading Aspose will fix the issue.”
+
+Instead:
+
+“The current Aspose version will be reviewed and, where an approved version contains relevant PDF annotation/merge fixes, upgraded as part of the remediation.”
+
+This keeps the RCA technically accurate.
+
+⸻
+
+15. Fix 7 – Review Annotation Handling
+
+Because the exception specifically references an annotation dictionary, the PDF handling needs to account for malformed or unsupported annotations.
+
+The implementation should determine whether the problematic annotation can be:
+
+* safely normalized,
+* removed,
+* ignored during merge,
+* or otherwise handled by the supported Aspose API.
+
+The preferred approach should be:
+
+Valid annotation
+      ↓
+Retain
+Unsupported/malformed annotation
+      ↓
+Handle safely
+      ↓
+Continue PDF processing
+
+Any removal of annotations should only be performed if annotations are not required for the business/document-delivery requirement.
+
+This should be confirmed during implementation rather than automatically removing all annotations.
+
+⸻
+
+16. Fix 8 – Improve the Current Generic Error Message
+
+The current message is too generic:
+
+something went wrong during sorting and merging of blankpage pdf
+
+It does not tell support:
+
+* which PDF failed,
+* which operation failed,
+* whether the failure happened while opening, adding pages, or saving,
+* whether any PDFs were skipped,
+* whether a final PDF was generated.
+
+The message should instead identify the processing stage and document.
+
+For example, conceptually:
+
+EPIC PDF merge failed for source file <filename>
+Stage: Page merge
+Exception: <exception>
+Action: PDF skipped
+Remaining valid PDF count: X
+
+⸻
+
+17. Expected Final Behavior After Fix
+
+For the production case:
+
+EPIC ZIP
+  ↓
+5 PDFs identified
+  ↓
+5 PDFs transformed
+  ↓
+Merge validation
+  ↓
+4 PDFs valid
+1 PDF fails annotation validation
+  ↓
+Problematic PDF logged
+72170-4_1002036770_20250617.pdf
+  ↓
+Blank page inserted
+  ↓
+4 valid PDFs + blank page merged
+  ↓
+Final PDF generated
+  ↓
+PDF optimization
+  ↓
+Normal delivery continues
+
+The ZIP should not fail solely because one PDF contains an unsupported/malformed annotation dictionary.
+
+⸻
+
+18. RCA Conclusion
+
+The production failure was caused by an Aspose PDF merge incompatibility with an annotation dictionary contained in one of the source EPIC PDFs. The individual PDFs were successfully generated, but the problematic document caused the final Aspose merge operation to fail with An attempt to create annotation using invalid dictionary. For the investigated EPIC case 76696817, the problematic document was identified as 72170-4_1002036770_20250617.pdf; excluding this document allowed the remaining documents to generate the final PDF successfully.
+
+The remediation will therefore focus on isolating and logging individual PDF merge failures, excluding only non-mergeable PDFs, allowing the remaining valid documents to continue through final PDF generation, and reviewing/upgrading the approved Aspose PDF version and annotation handling. This will prevent a single malformed/unsupported PDF from causing the entire ZIP processing flow to fail.
+
+⸻
+
+19. Implementation Changes – Short Summary for the Jira/POC
+
+You can put this as a table at the end of the document:
+
+Area	Change
+PDF Merge	Process/validate PDFs individually so one bad PDF does not fail the entire merge
+Exception Handling	Catch merge exceptions at individual PDF level
+Logging	Log filename, index, page count, stage, exception and stack trace
+Skipped PDFs	Maintain skipped-PDF list with exact reason
+ZIP Processing	Continue ZIP processing when only a non-critical PDF fails
+Final PDF	Generate final PDF using successfully processed PDFs
+Annotation Handling	Investigate/handle malformed or unsupported annotation dictionaries
+Aspose	Review current version and upgrade to approved version if relevant fixes are available
+Error Messages	Replace generic merge error with document/stage-specific messages
+Testing	Test normal PDFs, problematic production PDF, multiple PDFs, blank-page insertion and zero-valid-PDF scenario
+
+One important implementation principle
+
+Don’t simply catch the exception and continue using the same partially modified mergedDoc. The merge design should isolate the failing PDF before it can corrupt/fail the overall merge state—ideally through a validation/pre-merge step or an isolated merge attempt, followed by merging only the validated PDFs.
+
+That is the key technical point I would carry into the code implementation.
